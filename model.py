@@ -697,6 +697,262 @@ __device__ void causal_mask(float* s_tile, int q_row_start, int k_col_start,
     }
 }
 
-# Step 26 - flash_attention_causal_kernel (not yet solved)
-# TODO: implement
+# Step 26 - flash_attention_causal_kernel
+__global__ void flash_attention_causal_kernel(const float* q, const float* k, const float* v,
+                                               float* out, int seq_len, int head_dim,
+                                               int tile_q, int tile_k, float scale) {
+    int block_row = blockIdx.x;
+    int thread_id = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int q_row_start = block_row * tile_q;
+
+    // Shared-memory layout:
+    //
+    // q_tile      : tile_q * head_dim
+    // k_tile      : tile_k * head_dim
+    // v_tile      : tile_k * head_dim
+    // s_tile      : tile_q * tile_k
+    // row_max     : tile_q
+    // row_sum     : tile_q
+    // running_max : tile_q
+    // running_sum : tile_q
+    // out_acc     : tile_q * head_dim
+    extern __shared__ float smem[];
+
+    float* q_tile = smem;
+    float* k_tile = q_tile + tile_q * head_dim;
+    float* v_tile = k_tile + tile_k * head_dim;
+    float* s_tile = v_tile + tile_k * head_dim;
+
+    float* row_max = s_tile + tile_q * tile_k;
+    float* row_sum = row_max + tile_q;
+
+    float* running_max = row_sum + tile_q;
+    float* running_sum = running_max + tile_q;
+
+    float* out_acc = running_sum + tile_q;
+
+    // ------------------------------------------------------------
+    // Load Q tile once.
+    // ------------------------------------------------------------
+    load_tile(q, q_tile,
+              q_row_start, 0,
+              seq_len, head_dim,
+              tile_q, head_dim,
+              thread_id, num_threads);
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // Initialize running softmax state and output accumulator.
+    // ------------------------------------------------------------
+    for (int r = thread_id; r < tile_q; r += num_threads) {
+        running_max[r] = -3.402823466e+38F;
+        running_sum[r] = 0.0f;
+    }
+
+    for (int idx = thread_id;
+         idx < tile_q * head_dim;
+         idx += num_threads) {
+        out_acc[idx] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // Stream over K/V tiles.
+    //
+    // For causal attention, tiles completely to the right of the
+    // current Q tile contain only future keys, so they can be skipped.
+    // ------------------------------------------------------------
+    for (int k_start = 0;
+         k_start < seq_len &&
+         k_start <= q_row_start + tile_q - 1;
+         k_start += tile_k) {
+
+        // Load K tile.
+        load_tile(k, k_tile,
+                  k_start, 0,
+                  seq_len, head_dim,
+                  tile_k, head_dim,
+                  thread_id, num_threads);
+
+        // Load V tile.
+        load_tile(v, v_tile,
+                  k_start, 0,
+                  seq_len, head_dim,
+                  tile_k, head_dim,
+                  thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Compute scaled QK^T.
+        // --------------------------------------------------------
+        tile_scores(q_tile, k_tile, s_tile,
+                    tile_q, tile_k, head_dim, scale,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Mask:
+        //   1. Future keys: global_k > global_q
+        //   2. Keys beyond seq_len.
+        // --------------------------------------------------------
+        causal_mask(s_tile,
+                    q_row_start,
+                    k_start,
+                    tile_q,
+                    tile_k,
+                    thread_id,
+                    num_threads);
+
+        // Mask padded K positions from the final K tile.
+        for (int idx = thread_id;
+             idx < tile_q * tile_k;
+             idx += num_threads) {
+
+            int k_col = k_start + (idx % tile_k);
+
+            if (k_col >= seq_len) {
+                s_tile[idx] = -INFINITY;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Find per-row maximum of this score tile.
+        // --------------------------------------------------------
+        tile_rowmax(s_tile, row_max,
+                    tile_q, tile_k,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Convert scores to exp(score - tile_max).
+        // --------------------------------------------------------
+        tile_exp(s_tile, row_max,
+                 tile_q, tile_k,
+                 thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Sum the exponentials for every query row.
+        // --------------------------------------------------------
+        tile_rowsum(s_tile, row_sum,
+                    tile_q, tile_k,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Online softmax update.
+        //
+        // Old state:
+        //     running_sum * exp(old_max - new_max)
+        //
+        // Current tile:
+        //     row_sum * exp(tile_max - new_max)
+        //
+        // The output accumulator receives the same two rescalings.
+        // --------------------------------------------------------
+        for (int r = thread_id; r < tile_q; r += num_threads) {
+            int global_q = q_row_start + r;
+
+            // Rows outside the actual sequence are padding rows.
+            if (global_q < seq_len) {
+                float old_max = running_max[r];
+                float tile_max = row_max[r];
+
+                float new_max = online_max(old_max, tile_max);
+
+                float old_correction =
+                    correction_factor(old_max, new_max);
+
+                float tile_correction =
+                    correction_factor(tile_max, new_max);
+
+                running_sum[r] =
+                    update_running_sum(
+                        running_sum[r],
+                        old_correction,
+                        row_sum[r] * tile_correction
+                    );
+
+                rescale_output(
+                    out_acc + r * head_dim,
+                    head_dim,
+                    old_correction
+                );
+
+                running_max[r] = new_max;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Rescale current P tile from the tile-local maximum to
+        // the new running maximum.
+        // --------------------------------------------------------
+        for (int idx = thread_id;
+             idx < tile_q * tile_k;
+             idx += num_threads) {
+
+            int r = idx / tile_k;
+            int global_q = q_row_start + r;
+
+            if (global_q < seq_len) {
+                float tile_correction =
+                    correction_factor(row_max[r], running_max[r]);
+
+                s_tile[idx] *= tile_correction;
+            } else {
+                // Padding query rows are never written to output.
+                s_tile[idx] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Accumulate the current P_tile * V_tile.
+        // --------------------------------------------------------
+        accumulate_pv(
+            s_tile,
+            v_tile,
+            out_acc,
+            tile_q,
+            tile_k,
+            head_dim,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+    }
+
+    // ------------------------------------------------------------
+    // Normalize and write the final output.
+    // ------------------------------------------------------------
+    for (int idx = thread_id;
+         idx < tile_q * head_dim;
+         idx += num_threads) {
+
+        int r = idx / head_dim;
+        int d = idx % head_dim;
+
+        int global_row = q_row_start + r;
+
+        if (global_row < seq_len) {
+            out[global_row * head_dim + d] =
+                out_acc[idx] / running_sum[r];
+        }
+    }
+}
 

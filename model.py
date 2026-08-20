@@ -371,8 +371,259 @@ __device__ void accumulate_pv(const float* p_tile, const float* v_tile,
     }
 }
 
-# Step 23 - flash_attention_kernel (not yet solved)
-# TODO: implement
+# Step 23 - flash_attention_kernel
+__global__ void flash_attention_kernel(const float* q, const float* k, const float* v,
+                                       float* out, int seq_len, int head_dim,
+                                       int tile_q, int tile_k, float scale) {
+    int block_row = blockIdx.x;
+    int thread_id = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int q_row_start = block_row * tile_q;
+
+    /*
+        Shared-memory layout:
+
+        q_tile      : tile_q * head_dim
+        k_tile      : tile_k * head_dim
+        v_tile      : tile_k * head_dim
+        s_tile      : tile_q * tile_k
+        row_max     : tile_q
+        row_sum     : tile_q
+        running_max : tile_q
+        running_sum : tile_q
+        out_acc     : tile_q * head_dim
+    */
+    extern __shared__ float smem[];
+
+    float* q_tile = smem;
+    float* k_tile = q_tile + tile_q * head_dim;
+    float* v_tile = k_tile + tile_k * head_dim;
+    float* s_tile = v_tile + tile_k * head_dim;
+
+    float* row_max = s_tile + tile_q * tile_k;
+    float* row_sum = row_max + tile_q;
+
+    float* running_max = row_sum + tile_q;
+    float* running_sum = running_max + tile_q;
+
+    float* out_acc = running_sum + tile_q;
+
+    // ------------------------------------------------------------
+    // Load Q tile once.
+    // ------------------------------------------------------------
+    load_tile(q, q_tile,
+              q_row_start, 0,
+              seq_len, head_dim,
+              tile_q, head_dim,
+              thread_id, num_threads);
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // Initialize running softmax state and output accumulator.
+    // ------------------------------------------------------------
+    for (int r = thread_id; r < tile_q; r += num_threads) {
+        running_max[r] = -3.402823466e+38F;
+        running_sum[r] = 0.0f;
+    }
+
+    for (int idx = thread_id;
+         idx < tile_q * head_dim;
+         idx += num_threads) {
+        out_acc[idx] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // Stream over K/V tiles.
+    // ------------------------------------------------------------
+    for (int k_start = 0; k_start < seq_len; k_start += tile_k) {
+
+        // Load K tile.
+        load_tile(k, k_tile,
+                  k_start, 0,
+                  seq_len, head_dim,
+                  tile_k, head_dim,
+                  thread_id, num_threads);
+
+        // Load V tile.
+        load_tile(v, v_tile,
+                  k_start, 0,
+                  seq_len, head_dim,
+                  tile_k, head_dim,
+                  thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Compute scaled QK^T for this tile.
+        // --------------------------------------------------------
+        tile_scores(q_tile, k_tile, s_tile,
+                    tile_q, tile_k, head_dim, scale,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Mask keys outside the valid sequence length.
+        // --------------------------------------------------------
+        for (int idx = thread_id;
+             idx < tile_q * tile_k;
+             idx += num_threads) {
+
+            int k_col = k_start + (idx % tile_k);
+
+            if (k_col >= seq_len) {
+                s_tile[idx] = -3.402823466e+38F;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Find maximum score for each query row in this tile.
+        // --------------------------------------------------------
+        tile_rowmax(s_tile, row_max,
+                    tile_q, tile_k,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Compute exp(score - tile_max).
+        // s_tile now contains the tile-local probabilities.
+        // --------------------------------------------------------
+        tile_exp(s_tile, row_max,
+                 tile_q, tile_k,
+                 thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Compute sum(exp(score - tile_max)) for each row.
+        // --------------------------------------------------------
+        tile_rowsum(s_tile, row_sum,
+                    tile_q, tile_k,
+                    thread_id, num_threads);
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Update running online-softmax state.
+        //
+        // Correct recurrence:
+        //
+        // new_max = max(old_max, tile_max)
+        //
+        // old correction:
+        //     exp(old_max - new_max)
+        //
+        // tile correction:
+        //     exp(tile_max - new_max)
+        //
+        // new_sum =
+        //     old_sum * old_correction
+        //     + tile_sum * tile_correction
+        // --------------------------------------------------------
+        for (int r = thread_id; r < tile_q; r += num_threads) {
+
+            float old_max = running_max[r];
+            float tile_max = row_max[r];
+
+            float new_max = online_max(old_max, tile_max);
+
+            float old_correction =
+                correction_factor(old_max, new_max);
+
+            float tile_correction =
+                correction_factor(tile_max, new_max);
+
+            running_sum[r] =
+                update_running_sum(
+                    running_sum[r],
+                    old_correction,
+                    row_sum[r] * tile_correction
+                );
+
+            // Rescale previously accumulated output into
+            // the new maximum frame.
+            rescale_output(
+                out_acc + r * head_dim,
+                head_dim,
+                old_correction
+            );
+
+            running_max[r] = new_max;
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Rescale the CURRENT tile from tile_max to new_max.
+        //
+        // tile_exp produced:
+        //
+        //     exp(score - tile_max)
+        //
+        // but we need:
+        //
+        //     exp(score - new_max)
+        //
+        // Therefore multiply by:
+        //
+        //     exp(tile_max - new_max)
+        // --------------------------------------------------------
+        for (int idx = thread_id;
+             idx < tile_q * tile_k;
+             idx += num_threads) {
+
+            int r = idx / tile_k;
+
+            float tile_correction =
+                correction_factor(row_max[r], running_max[r]);
+
+            s_tile[idx] *= tile_correction;
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Accumulate the correctly rescaled P_tile * V_tile.
+        // --------------------------------------------------------
+        accumulate_pv(
+            s_tile,
+            v_tile,
+            out_acc,
+            tile_q,
+            tile_k,
+            head_dim,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+    }
+
+    // ------------------------------------------------------------
+    // Normalize the final accumulated output.
+    // ------------------------------------------------------------
+    for (int idx = thread_id;
+         idx < tile_q * head_dim;
+         idx += num_threads) {
+
+        int r = idx / head_dim;
+        int d = idx % head_dim;
+
+        int global_row = q_row_start + r;
+
+        if (global_row < seq_len) {
+            out[global_row * head_dim + d] =
+                out_acc[idx] / running_sum[r];
+        }
+    }
+}
 
 # Step 24 - flash_attention_launcher (not yet solved)
 # TODO: implement

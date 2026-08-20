@@ -625,8 +625,58 @@ __global__ void flash_attention_kernel(const float* q, const float* k, const flo
     }
 }
 
-# Step 24 - flash_attention_launcher (not yet solved)
-# TODO: implement
+# Step 24 - flash_attention_launcher
+void flash_attention_launcher(const float* d_q, const float* d_k, const float* d_v,
+                              float* d_out, int seq_len, int head_dim,
+                              int tile_q, int tile_k) {
+    // Scale factor: 1 / sqrt(head_dim)
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    // One block processes one tile of query rows.
+    int blocks = (seq_len + tile_q - 1) / tile_q;
+
+    // Use 128 threads per block.
+    int threads = 128;
+
+    // Dynamic shared-memory requirement:
+    //
+    // q_tile      = tile_q * head_dim
+    // k_tile      = tile_k * head_dim
+    // v_tile      = tile_k * head_dim
+    // s_tile      = tile_q * tile_k
+    // row_max     = tile_q
+    // row_sum     = tile_q
+    // running_max = tile_q
+    // running_sum = tile_q
+    // out_acc     = tile_q * head_dim
+    //
+    // Total:
+    // 2 * tile_q * head_dim
+    // + 2 * tile_k * head_dim
+    // + tile_q * tile_k
+    // + 4 * tile_q
+    size_t shared_elements =
+        2ULL * tile_q * head_dim +
+        2ULL * tile_k * head_dim +
+        1ULL * tile_q * tile_k +
+        4ULL * tile_q;
+
+    size_t shared_bytes =
+        shared_elements * sizeof(float);
+
+    // Launch one block per query tile.
+    flash_attention_kernel<<<blocks, threads, shared_bytes>>>(
+        d_q,
+        d_k,
+        d_v,
+        d_out,
+        seq_len,
+        head_dim,
+        tile_q,
+        tile_k,
+        scale
+    );
+}
 
 # Step 25 - causal_mask (not yet solved)
 # TODO: implement

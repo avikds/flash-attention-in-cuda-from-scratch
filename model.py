@@ -286,8 +286,26 @@ __device__ void load_tile(const float* src, float* shared_dst,
     }
 }
 
-# Step 18 - tile_scores (not yet solved)
-# TODO: implement
+# Step 18 - tile_scores
+__device__ void tile_scores(const float* q_tile, const float* k_tile, float* s_tile,
+                            int tile_q, int tile_k, int head_dim, float scale,
+                            int thread_id, int num_threads) {
+    int tile_size = tile_q * tile_k;
+
+    for (int idx = thread_id; idx < tile_size; idx += num_threads) {
+        int i = idx / tile_k;
+        int j = idx % tile_k;
+
+        float dot = 0.0f;
+
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_tile[i * head_dim + d] *
+                   k_tile[j * head_dim + d];
+        }
+
+        s_tile[idx] = dot * scale;
+    }
+}
 
 # Step 19 - tile_rowmax (not yet solved)
 # TODO: implement

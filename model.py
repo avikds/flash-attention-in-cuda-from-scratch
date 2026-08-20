@@ -115,8 +115,69 @@ __global__ void qk_scores(const float* q, const float* k, float* scores, int seq
     }
 }
 
-# Step 10 - softmax_rows (not yet solved)
-# TODO: implement
+# Step 10 - softmax_rows
+__global__ void softmax_rows(float* matrix, int rows, int cols) {
+    int r = blockIdx.x;
+
+    if (r >= rows) {
+        return;
+    }
+
+    __shared__ float shared_max[1024];
+    __shared__ float shared_sum[1024];
+
+    int tid = threadIdx.x;
+
+    // Find the maximum value in this row.
+    float local_max = -3.402823466e+38F;
+
+    for (int c = tid; c < cols; c += blockDim.x) {
+        local_max = fmaxf(local_max, matrix[r * cols + c]);
+    }
+
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    // Reduce maximum across the block.
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_max[tid] = fmaxf(
+                shared_max[tid],
+                shared_max[tid + stride]
+            );
+        }
+        __syncthreads();
+    }
+
+    float row_max = shared_max[0];
+
+    // Compute exp(x - max) and the local sum.
+    float local_sum = 0.0f;
+
+    for (int c = tid; c < cols; c += blockDim.x) {
+        float value = expf(matrix[r * cols + c] - row_max);
+        matrix[r * cols + c] = value;
+        local_sum += value;
+    }
+
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    // Reduce the sum across the block.
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float row_sum = shared_sum[0];
+
+    // Normalize the row.
+    for (int c = tid; c < cols; c += blockDim.x) {
+        matrix[r * cols + c] /= row_sum;
+    }
+}
 
 # Step 11 - pv_matmul (not yet solved)
 # TODO: implement

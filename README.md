@@ -37,6 +37,31 @@ python scaffold.py
 - [x] **25.** causal_mask
 - [x] **26.** flash_attention_causal_kernel
 
----
+## Results
 
-Built on Deep-ML.
+```
+vector_add+scale_array[0..3]: 8.00 8.00 8.00 8.00
+Q row0 max=0.3402 sum=0.5278
+
+--- Attention outputs (seq_len=8, head_dim=4) ---
+naive  row 0:  0.0950  0.0663 -0.1126  0.0952 
+flash  row 0:  0.0950  0.0663 -0.1126  0.0952 
+causal row 0:  0.2831 -0.3024 -0.2222  0.1289 
+naive  row 7:  0.0810  0.0570 -0.1095  0.0987 
+flash  row 7:  0.0810  0.0570 -0.1095  0.0987 
+causal row 7:  0.0810  0.0570 -0.1095  0.0987 
+
+max|naive - flash| = 2.235174e-08
+
+--- Memory: naive O(N^2) scores vs flash O(1) global scratch ---
+  this run (seq_len=8): naive scores = 256 bytes, flash global scratch = 0
+       seq_len       naive scores      flash scratch
+          1024             4.2 MB    ~0 (tiles only)
+          8192           268.4 MB    ~0 (tiles only)
+         32768          4295.0 MB    ~0 (tiles only)
+        131072         68719.5 MB    ~0 (tiles only)
+  Flash keeps only a tile in shared memory (tens of KB per block), so it runs
+  at sequence lengths where the naive score matrix would not fit in GPU memory.
+  (This from-scratch kernel favors clarity over speed; it is not throughput-
+   optimized like production FlashAttention -- the win here is memory scaling.)
+```
